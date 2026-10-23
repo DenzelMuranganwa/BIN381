@@ -1,0 +1,852 @@
+---
+title: "South African Unemployment & Labour Market Exclusion"
+author: "Denzel Takunda Muranganwa, Goitsemang Baloyi, and Noliyolo Mamello Khot"
+date: "`r Sys.Date()`"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, error = TRUE, warning= FALSE)
+options(width = 80)
+```
+
+# STEP 1: SETUP & LIBRARIES
+
+```{r setup_libraries}
+library(tidyverse)   # core data cleaning + plotting
+library(scales)      # plot label formatting
+library(knitr)       # kable() tables
+library(janitor)     # available for data cleaning utilities
+library(caret)       # model training & confusion matrix evaluations
+library(pROC)        # ROC & AUC evaluation
+library(randomForest)# ensemble tree model implementation
+library(e1071)       # naive bayes model implementation
+library(gmodels)     # cross-table analysis
+library(ranger)      # fast random forest C++ implementation
+
+#install.packages("C50")
+library(C50)
+
+set.seed(2026)
+
+```
+
+# STEP 2: DATA IMPORT & BASELINE VERIFICATION
+
+```{r data_import}
+# HouseholdID is an 18-digit ID. Import as character to prevent numeric rounding.
+hh_char <- c(HouseholdID = "character")
+d01 <- read.csv("data/raw/D01_Population_Profile.csv", colClasses = hh_char)
+d02 <- read.csv("data/raw/D02_Learning_Profile.csv", colClasses = hh_char)
+d03 <- read.csv("data/raw/D03_Economic_Participation.csv", colClasses = hh_char)
+d11 <- read.csv("data/raw/D11_Labour_Market.csv", colClasses = hh_char)
+
+dim_summary <- data.frame(
+  Dataset = c("D01_Population", "D02_Learning", "D03_Economic", "D11_Labour"),
+  Rows = c(nrow(d01), nrow(d02), nrow(d03), nrow(d11)),
+  Columns = c(ncol(d01), ncol(d02), ncol(d03), ncol(d11))
+)
+kable(dim_summary, caption = "Baseline Raw Dataset Dimensions")
+
+
+```
+
+# DIAGNOSTIC CHECKS ACROSS ALL DATASETS
+
+```{r diagnostics, comment=NA}
+all_datasets <- list(
+  D01_Population = d01,
+  D02_Learning   = d02,
+  D03_Economic   = d03,
+  D11_Labour     = d11
+)
+
+# 1. Exact Duplicate Rows Summary
+duplicate_summary <- data.frame(
+  Dataset = names(all_datasets),
+  Exact_Duplicate_Rows = sapply(all_datasets, function(df) sum(duplicated(df)))
+)
+kable(duplicate_summary, caption = "Summary of Exact Duplicate Rows Across Raw Datasets")
+
+# 2. Missing Values Summary
+missing_summary <- map_df(names(all_datasets), function(name) {
+  df <- all_datasets[[name]]
+  missing_vals <- colSums(is.na(df))
+  missing_vals <- missing_vals[missing_vals > 0]
+  
+  if (length(missing_vals) > 0) {
+    tibble(
+      Dataset = name,
+      Column = names(missing_vals),
+      Missing_Count = as.integer(missing_vals),
+      Missing_Pct = round(as.integer(missing_vals) / nrow(df) * 100, 2)
+    )
+  } else {
+    tibble(Dataset = name, Column = "None", Missing_Count = 0, Missing_Pct = 0)
+  }
+})
+kable(missing_summary, caption = "Missing Value Breakdown per Dataset")
+
+# 3. Column Data Types Overview
+col_types_summary <- map_df(names(all_datasets), function(name) {
+  df <- all_datasets[[name]]
+  types <- sapply(df, function(x) paste(class(x), collapse = ", "))
+  
+  tibble(
+    Dataset = name,
+    Total_Columns = ncol(df),
+    Numeric_Cols = sum(types %in% c("numeric", "integer")),
+    Character_Cols = sum(types == "character"),
+    Factor_or_Other = sum(!types %in% c("numeric","integer", "character"))
+  )
+})
+
+kable(col_types_summary, caption = "Column Data Type Distribution Across Raw Datasets")
+
+
+
+```
+
+# STEP 3: FUNCTIONS
+
+```{r utility_functions}
+format_ids <- function(df) {
+  hh_names <- c("household_id", "HouseholdID")
+  p_names  <- c("person_number", "PersonNumber")
+  hh_col <- hh_names[hh_names %in% names(df)][1]
+  p_col  <- p_names[p_names %in% names(df)][1]
+
+  df %>%
+    mutate(
+      household_id_clean = str_trim(as.character(.data[[hh_col]])),
+      person_number_clean = str_trim(as.character(.data[[p_col]])),
+      composite_id = paste(household_id_clean, person_number_clean, sep = "_")
+    )
+}
+
+clean_province <- function(df) {
+  if ("Province" %in% names(df)) {
+    df %>% mutate(province_clean = str_to_title(str_trim(as.character(Province))))
+  } else if ("province" %in% names(df)) {
+    df %>% mutate(province_clean = str_to_title(str_trim(as.character(province))))
+  } else if ("ProvinceCode" %in% names(df)) {
+    df %>% mutate(province_clean = as.character(ProvinceCode))
+  } else {
+    df %>% mutate(province_clean = "Unspecified")
+  }
+}
+
+```
+
+# STEP 4: BUILDING THE KEYS
+
+```{r build_keys}
+d01 <- format_ids(d01)
+d02 <- format_ids(d02)
+d03 <- format_ids(d03)
+d11 <- format_ids(d11)
+
+```
+
+# STEP 5: DATA CLEANING
+
+```{r data_cleaning}
+# D01: Population Cleaning
+d01_clean <- d01 %>%
+  filter(!is.na(HouseholdID)) %>%
+  mutate(age = as.numeric(Age)) %>%
+  filter(!is.na(age), age >= 15 & age <= 64) %>%
+  clean_province() %>%
+  distinct(composite_id, .keep_all = TRUE)
+
+# D02: Learning Profile Cleaning
+d02_clean <- d02 %>%
+  mutate(
+    edu_code_num = as.numeric(EducationLevelCode),
+    edu_group = case_when(
+      edu_code_num < 10 ~ "Primary or Lower",
+      edu_code_num %in% c(10, 11, 12) ~ "Secondary / Matric",
+      edu_code_num > 12 & edu_code_num < 98 ~ "Tertiary / Diploma / Degree",
+      TRUE ~ "Other / Unspecified"
+    ),
+    EducationAttendanceCode = na_if(EducationAttendanceCode, "N/A"),
+    EducationAttendanceCode = na_if(EducationAttendanceCode, "Unknown"),
+    EducationAttendanceCode = na_if(EducationAttendanceCode, "not recorded")
+  ) %>%
+  distinct(composite_id, .keep_all = TRUE)
+
+# D03: Economic Participation Cleaning
+d03_clean <- d03 %>%
+  mutate(
+    salary_amount_raw = as.numeric(SalaryAmountRaw),
+    salary_bad = salary_amount_raw < 0 | salary_amount_raw > 1e300,
+    salary_amount_raw = if_else(salary_bad, NA_real_, salary_amount_raw)
+  ) %>%
+  select(-salary_bad) %>%
+  distinct(composite_id, .keep_all = TRUE)
+
+# D11: Labour Force Target Cleaning
+d11_clean <- d11 %>%
+  mutate(composite_id = paste(composite_id, SurveyYear, Quarter, sep = "_")) %>%
+  mutate(across(where(is.numeric), ~ if_else(. > 1e300, NA_real_, .))) %>%
+  mutate(
+    emp_code_num = as.numeric(EmploymentStatusCode),
+    monthly_amount_raw = if_else(MonthlyAmountRaw < 0, NA_real_, MonthlyAmountRaw),
+    hours_worked_raw = suppressWarnings(as.numeric(HoursWorkedRaw)),
+    hours_worked_raw = if_else(hours_worked_raw < 0 | hours_worked_raw > 1e300,
+                                NA_real_, hours_worked_raw),
+    status_label = case_when(
+      emp_code_num == 1 ~ "Employed",
+      emp_code_num == 2 ~ "Unemployed",
+      emp_code_num == 3 ~ "Discouraged Seeker",
+      emp_code_num == 4 ~ "Other Inactive",
+      TRUE ~ "Unspecified"
+    ),
+    age_valid = Age >= 0 & Age <= 100
+  ) %>%
+  filter(age_valid) %>%
+  group_by(OccupationCode) %>%
+  mutate(hours_worked_raw = if_else(is.na(hours_worked_raw),
+                                     median(hours_worked_raw, na.rm = TRUE),
+                                     hours_worked_raw)) %>%
+  ungroup() %>%
+  mutate(hours_worked_raw = if_else(is.nan(hours_worked_raw), NA_real_,
+                                     hours_worked_raw)) %>%
+  distinct(composite_id, .keep_all = TRUE)
+
+d01_clean <- d01_clean %>% select(-any_of(c("SurveyVersion", "DataCollectorID", "BatchNumber")))
+
+```
+
+# SELECTION & GRAIN IMPACT EVIDENCE
+
+```{r selection_evidence, comment=NA}
+selection_summary <- data.frame(
+  Dataset = c("D01_Population", "D02_Learning", "D03_Economic", "D11_Labour"),
+  Raw_Rows = c(nrow(d01), nrow(d02), nrow(d03), nrow(d11)),
+  Clean_Unique_Grain_Rows = c(nrow(d01_clean), nrow(d02_clean), nrow(d03_clean), nrow(d11_clean))
+)
+kable(selection_summary, caption = "Task 1 & 2: Row Reduction from Preprocessing and Selection")
+
+```
+
+# STEP 6: VERIFICATION CHECKS
+
+```{r verification_checks, comment=NA}
+cleaned_datasets <- list(
+  D01_Clean = d01_clean,
+  D02_Clean = d02_clean,
+  D03_Clean = d03_clean,
+  D11_Clean = d11_clean
+)
+
+# 1. Duplicate composite IDs
+sapply(cleaned_datasets, function(df) sum(duplicated(df$composite_id)))
+
+# 2. Sentinel max values (> 1e300)
+sapply(cleaned_datasets, function(df) {
+  num_cols <- df %>% select(where(is.numeric))
+  sum(num_cols > 1e300, na.rm = TRUE)
+})
+
+# 3. Negative values in monetary/hours columns
+c(
+  d03_neg_salary  = sum(d03_clean$salary_amount_raw < 0, na.rm = TRUE),
+  d11_neg_monthly = sum(d11_clean$monthly_amount_raw < 0, na.rm = TRUE),
+  d11_neg_hours   = sum(d11_clean$hours_worked_raw < 0, na.rm = TRUE)
+)
+
+# 4. D11 quarter balance
+table(d11_clean$Quarter)
+
+# 5. Recoding Traceability Checks
+table(Raw = d02_clean$EducationLevelCode, Recoded = d02_clean$edu_group, useNA = "ifany")
+table(Raw = d11_clean$EmploymentStatusCode, Recoded = d11_clean$status_label, useNA = "ifany")
+
+# 6. Income Distribution Screening
+quantile(d03_clean$salary_amount_raw, probs = c(0.5, 0.75, 0.90, 0.95, 0.99, 1), na.rm = TRUE)
+quantile(d11_clean$monthly_amount_raw, probs = c(0.5, 0.75, 0.90, 0.95, 0.99, 1), na.rm = TRUE)
+
+```
+
+# STEP 7: CAN D11 BE JOINED TO D01/D02/D03?
+
+```{r relationship_check, comment=NA}
+d01_hh <- unique(d01_clean$HouseholdID)
+d11_hh <- unique(d11_clean$HouseholdID)
+d01_pkey <- unique(paste(d01_clean$HouseholdID, d01_clean$PersonNumber))
+d11_pkey <- unique(paste(d11_clean$HouseholdID, d11_clean$PersonNumber))
+
+rel_check <- tibble(
+  Check = c("Household IDs (D01 found in D11)", "Person keys (D01 found in D11)"),
+  Matched = c(sum(d01_hh %in% d11_hh), sum(d01_pkey %in% d11_pkey)),
+  Total_D01 = c(length(d01_hh), length(d01_pkey))
+)
+kable(rel_check, caption = "D01 vs D11 key overlap")
+
+area01 <- unique(substr(d01_hh, 1, 6))
+area11 <- unique(substr(d11_hh, 1, 6))
+cat("Area/cluster code overlap:", sum(area01 %in% area11), "of", length(area01), "\n")
+
+```
+
+Zero overlap exists at both household and person level.
+**D11 cannot be row-joined to D01-D03.** We treat them as two parallel tracks: Track A (D11 alone, all 4 quarters) and Track B (D01+D02+D03 joined, Q1 2024 only).
+
+# STEP 8: INTEGRATING D01 x D02 x D03 (TRACK B)
+
+```{r trackb_join, comment=NA}
+pkey01 <- paste(d01_clean$HouseholdID, d01_clean$PersonNumber)
+pkey02 <- paste(d02_clean$HouseholdID, d02_clean$PersonNumber)
+pkey03 <- paste(d03_clean$HouseholdID, d03_clean$PersonNumber)
+
+match_evidence <- tibble(
+  Check = c("D01 keys found in D02", "D01 keys found in D03"),
+  Matched = c(sum(pkey01 %in% pkey02), sum(pkey01 %in% pkey03)),
+  Total = length(pkey01),
+  Pct = round(100 * Matched / Total, 2)
+)
+kable(match_evidence, caption = "D01-D02-D03 person-key match rate")
+
+d01_clean <- d01_clean %>% mutate(pkey = paste(HouseholdID, PersonNumber))
+d02_clean <- d02_clean %>% mutate(pkey = paste(HouseholdID, PersonNumber))
+d03_clean <- d03_clean %>% mutate(pkey = paste(HouseholdID, PersonNumber))
+
+n_before <- nrow(d01_clean)
+
+d02_cols <- c("pkey", "EducationLevelCode", "EducationAttendanceCode",
+              "InstitutionTypeCode", "GradeCode", "TotalEducationFees",
+              "NoFeesSchoolCode", "edu_group")
+d03_cols <- c("pkey", "WageWorkCode", "BusinessWorkCode", "LookingForWorkCode",
+              "VolunteerWorkCode", "RetiredCode", "SectorCode", "salary_amount_raw",
+              "EmploymentStatus1Code", "EmploymentStatus2Code")
+
+household_profile <- d01_clean %>%
+  inner_join(d02_clean %>% select(all_of(d02_cols)), by = "pkey") %>%
+  inner_join(d03_clean %>% select(all_of(d03_cols)), by = "pkey")
+
+n_after <- nrow(household_profile)
+keys_unique <- length(unique(household_profile$pkey)) == n_after
+cat("Rows before join:", n_before, " | after join:", n_after, "\n")
+cat("1:1 join confirmed (no fan-out):", keys_unique, "\n")
+
+```
+
+# STEP 9: FEATURE ENGINEERING
+
+```{r trackb_features, comment=NA}
+# Track B (D01+D02+D03, Q1 2024)
+household_profile <- household_profile %>%
+  mutate(
+    gender = case_when(
+      SexCode == 1 ~ "Male", SexCode == 2 ~ "Female", TRUE ~ NA_character_
+    ),
+    geo_type = case_when(
+      GeoTypeCode == 1 ~ "Urban",
+      GeoTypeCode == 2 ~ "Rural (Traditional)",
+      GeoTypeCode == 3 ~ "Rural (Farms)",
+      TRUE ~ NA_character_
+    ),
+    population_group = case_when(
+      PopulationGroupCode == 1 ~ "Black African",
+      PopulationGroupCode == 2 ~ "Coloured",
+      PopulationGroupCode == 3 ~ "Indian/Asian",
+      PopulationGroupCode == 4 ~ "White",
+      TRUE ~ NA_character_
+    ),
+    age_band = if_else(age >= 15 & age <= 34, "Youth (15-34)", "Adult (35-64)"),
+    employment_status_q1 = case_when(
+      EmploymentStatus1Code == 1 ~ "Employed",
+      EmploymentStatus1Code == 2 ~ "Unemployed",
+      EmploymentStatus1Code == 8 ~ "Not Economically Active",
+      TRUE ~ "Unspecified"
+    ),
+    job_search_active = case_when(
+      LookingForWorkCode == 1 ~ "Actively Looking",
+      LookingForWorkCode == 2 ~ "Not Looking",
+      TRUE ~ "Not Applicable"
+    ),
+    has_income = !is.na(salary_amount_raw) & salary_amount_raw > 0,
+    has_salary_income = if_else(has_income, "Has Salary Income", "No Salary Income"),
+    currently_studying = case_when(
+      EducationAttendanceCode == "1" ~ "Yes",
+      EducationAttendanceCode == "2" ~ "No",
+      TRUE ~ NA_character_
+    ),
+    not_engaged = currently_studying == "No" &
+      employment_status_q1 != "Employed" &
+      job_search_active != "Actively Looking",
+    not_engaged_flag = if_else(not_engaged, "Possibly Disengaged",
+                                "Engaged/Studying/Working", missing = NA_character_)
+  ) %>%
+  select(-has_income, -not_engaged)
+
+kable(as.data.frame(table(household_profile$employment_status_q1)),
+      col.names = c("Q1 employment status", "N"), caption = "Track B employment status")
+
+```
+
+```{r figB, fig.cap="Q1 2024 employment status - Track B", out.width="80%"}
+household_profile %>% filter(!is.na(employment_status_q1)) %>%
+  count(employment_status_q1) %>% mutate(pct = n/sum(n)*100) %>%
+  ggplot(aes(x = reorder(employment_status_q1, pct), y = pct)) +
+  geom_col(fill = "#56B4E9") + coord_flip() + theme_minimal() +
+  labs(x = NULL, y = "% of matched persons")
+
+```
+
+```{r trackA_features, comment=NA}
+# Track A (D11, all 4 quarters)
+d11_clean <- d11_clean %>%
+  mutate(
+    gender = case_when(
+      GenderCode == 1 ~ "Male", GenderCode == 2 ~ "Female", TRUE ~ NA_character_
+    ),
+    geo_type = case_when(
+      GeoTypeCode == 1 ~ "Urban",
+      GeoTypeCode == 2 ~ "Rural (Traditional)",
+      GeoTypeCode == 3 ~ "Rural (Farms)",
+      TRUE ~ NA_character_
+    ),
+    population_group = case_when(
+      PopulationGroupCode == 1 ~ "Black African",
+      PopulationGroupCode == 2 ~ "Coloured",
+      PopulationGroupCode == 3 ~ "Indian/Asian",
+      PopulationGroupCode == 4 ~ "White",
+      TRUE ~ NA_character_
+    ),
+    youth_flag = if_else(Age >= 15 & Age <= 34, "Youth (15-34)", "Non-Youth (35+)"),
+    labour_force = emp_code_num %in% c(1, 2),
+    neet = case_when(
+      NEETCode == 1 ~ "Yes", NEETCode == 2 ~ "No", TRUE ~ NA_character_
+    ),
+    quarter_label = paste0("Q", Quarter, " ", SurveyYear),
+    informal_employment = case_when(
+      InformalEmploymentCode == 1 ~ "Informal",
+      InformalEmploymentCode == 2 ~ "Formal",
+      TRUE ~ NA_character_
+    )
+  )
+
+kable(as.data.frame(table(d11_clean$status_label)), col.names = c("Status", "N"),
+      caption = "Track A employment status, all 4 quarters")
+
+```
+
+```{r figC, fig.cap="Disengagement proxy by age band - Track B", out.width="80%"}
+disengagement_colors <- c(
+  "Engaged/Studying/Working" = "#0072B2",
+  "Possibly Disengaged" = "#D55E00"
+)
+
+household_profile %>%
+  filter(!is.na(not_engaged_flag)) %>%
+  count(age_band, not_engaged_flag) %>%
+  group_by(age_band) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ggplot(aes(x = age_band, y = pct, fill = not_engaged_flag)) +
+  geom_col(position = "fill") +
+  scale_y_continuous(labels = percent) +
+  theme_minimal() +
+  labs(x = NULL, y = "Proportion", fill = NULL) +
+  scale_fill_manual(values = disengagement_colors)
+
+```
+
+# STEP 10: DATA DICTIONARY + EXPORTS
+
+```{r build_dictionary, comment=NA}
+dir.create("data/Cleaned", showWarnings = FALSE, recursive = TRUE)
+
+data_dict <- tribble(
+  ~Track, ~Variable, ~Description,
+  "B", "pkey", "HouseholdID_PersonNumber key",
+  "B", "province_clean / gender / population_group", "Standardised demographics (D01)",
+  "B", "age / age_band", "Age 15-64; Youth/Adult band",
+  "B", "geo_type", "Urban / Rural (Traditional/Farms)",
+  "B", "edu_group", "Education tier (D02)",
+  "B", "currently_studying", "From EducationAttendanceCode",
+  "B", "employment_status_q1", "From EmploymentStatus1Code",
+  "B", "job_search_active", "From LookingForWorkCode",
+  "B", "has_salary_income", "From salary_amount_raw",
+  "B", "not_engaged_flag", "Not studying/employed/job-seeking",
+  "A", "composite_id", "HHID_Person_Year_Quarter",
+  "A", "gender / population_group / geo_type", "Standardised demographics (D11)",
+  "A", "youth_flag", "Youth (15-34) vs Non-Youth",
+  "A", "status_label", "Employed/Unemployed/Discouraged/Other",
+  "A", "labour_force", "TRUE if Employed or Unemployed",
+  "A", "neet", "Not in Education/Employment/Training",
+  "A", "informal_employment", "From InformalEmploymentCode",
+  "A", "quarter_label", "e.g. 'Q1 2024'",
+  "A", "monthly_amount_raw / hours_worked_raw", "EDA only - leakage risk as features"
+)
+write.csv(data_dict, "data/Cleaned/Data_Dictionary_Integration.csv", row.names = FALSE)
+kable(data_dict, caption = "Data dictionary (A = Labour Panel, B = Household Profile)")
+
+```
+
+```{r final_exports, comment=NA}
+hp_cols <- c("pkey", "composite_id", "province_clean", "gender", "population_group",
+             "age", "age_band", "geo_type", "edu_group", "currently_studying",
+             "employment_status_q1", "job_search_active", "has_salary_income",
+             "salary_amount_raw", "not_engaged_flag")
+lp_cols <- c("composite_id", "HouseholdID", "PersonNumber", "SurveyYear", "Quarter",
+             "quarter_label", "Province", "gender", "population_group", "geo_type",
+             "Age", "youth_flag", "status_label", "labour_force", "neet",
+             "informal_employment", "monthly_amount_raw", "hours_worked_raw")
+
+household_profile_export <- household_profile %>% select(all_of(hp_cols))
+labour_panel_export <- d11_clean %>% select(all_of(lp_cols))
+
+hp_path <- "data/Cleaned/HouseholdProfile_D01_D02_D03_integrated.csv"
+lp_path <- "data/Cleaned/LabourPanel_D11_integrated.csv"
+write.csv(household_profile_export, hp_path, row.names = FALSE)
+write.csv(labour_panel_export, lp_path, row.names = FALSE)
+
+```
+
+# MODELLING STRATEGY & MODEL BUILDING
+
+## 1.1 Analytical Question & Project Scope
+
+The primary objective of this study is to address the following analytical question:
+
+> **"To what extent can demographic, regional, and educational indicators predict individual unemployment risk in South Africa, and which predictors hold the highest influence?"**
+
+By framing this as a data-driven policy problem, the analysis aims to identify structural vulnerabilities within the labour market and highlight critical factors contributing to labour market exclusion.
+
+## 1.2 Modelling Type
+
+This problem is formulated as a **supervised binary classification** task.
+The target variable, `Unemployed`, is binary: \* **`1` ("Unemployed")**: Individuals actively seeking work or classified as unemployed.
+\* **`0` ("Not_Unemployed")**: Individuals who are employed, discouraged job-seekers, or otherwise inactive.
+
+## 1.3 Target Definition & Target Leakage Prevention
+
+To ensure valid predictive modeling and avoid data leakage, strict governance controls were applied during feature selection:
+
+1.  **Outcome-Derived Identifiers:** Variables directly derived from the target or employment status code (such as `NEETCode`, `labour_force`, `status_label`) were dropped.
+2.  **Post-Unemployment Features:** Attributes that exist exclusively for employed individuals (e.g., `MonthlyAmountRaw`, `HoursWorkedRaw`, `OccupationCode`, `IndustryCode`, `InformalEmploymentCode`) were removed. Including these would cause artificial leakage, as missingness or values in these fields perfectly separate employed individuals from unemployed ones.
+3.  **Weight & Identifier Removal:** Non-predictive survey identifiers (`HouseholdID`, `PersonNumber`) and survey sampling weights (`QuarterWeight`, `AnnualWeight`) were excluded.
+
+## 1.4 Preprocessing Strategy
+
+Data preprocessing is managed using the `recipes` framework to ensure reproducibility and prevent train-test data contamination: \* **Factor Level Handling:** Novel categorical levels in the test set are handled via `step_novel()`, while missing categorical values are assigned an explicit `"unknown"` category using `step_unknown()`.
+\* **Imputation:** Missing continuous predictor values are imputed using median imputation via `step_impute_median()` directly within the recipe pipeline prior to dummy transformation.
+\* **Variance & Linear Combination Filtering:** Variables with zero or near-zero variance are removed using `step_nzv()` and `step_zv()`, while exact linear dependencies are resolved via `step_lincomb()`.
+\* **Categorical Encoding:** Predictors are dynamic dummy-encoded using `step_dummy()` for model compatibility.
+
+## 1.5 Candidate Models & Theoretical Assumptions
+
+Three diverse algorithms were selected to balance interpretability, probability calibration, and non-linear predictive capacity:
+
+1.  **Logistic Regression (`glm` - Baseline Model):**
+    - *Rationale:* Serves as an interpretable linear baseline.
+    - *Assumptions:* Assumes a linear relationship between numeric predictors and the log-odds of being unemployed, absence of severe multicollinearity, and independent observations.
+2.  **Naïve Bayes (`e1071`):**
+    - *Rationale:* A probabilistic classifier that efficiently processes high-dimensional, categorical baseline data.
+    - *Assumptions:* Assumes class-conditional independence among predictors (i.e., predictors are independent given the target class).
+3.  **Random Forest (`ranger` / `caret` - Advanced Model):**
+    - *Rationale:* An ensemble of decision trees capable of capturing non-linear interactions and complex relationships without strict distribution assumptions.
+    - *Assumptions:* Non-parametric; does not assume linear relationships or specific variable distributions.
+
+## 1.6 Resampling & Tuning Design
+
+To ensure robust evaluation and prevent overfitting: \* **Stratified Split:** Data is partitioned into a **70% Training Set** and a **30% Test Set** using stratified sampling on the `Unemployed` outcome to preserve class proportions.
+\* **Cross-Validation:** Models are trained using **5-Fold Cross-Validation** (`trainControl(method = "cv", number = 5)`), ensuring parameter stability and reliable performance estimation across folds.
+
+# STEP 11: MODELLING PREPARATION & LEAKAGE CONTROL
+
+## 11.1 Target definition
+
+```{r target_definition, comment=NA}
+library(rsample)
+library(recipes)
+
+d11_model <- d11_clean %>%
+  mutate(Unemployed = case_when(
+    status_label == "Unemployed"                     ~ 1L,
+    status_label %in% c("Employed", "Other Inactive",
+                        "Discouraged Seeker")        ~ 0L,
+    TRUE                                              ~ NA_integer_
+  )) %>%
+  filter(!is.na(Unemployed))
+
+cat("Rows available for modelling:", nrow(d11_model), "\n")
+cat("Class distribution (Unemployed):\n")
+print(prop.table(table(d11_model$Unemployed)))
+
+```
+
+## 11.2 Leakage control
+
+```{r leakage_removal, comment=NA}
+identifier_vars <- c(
+  "HouseholdID", "PersonNumber", "SurveyDateRaw",
+  "household_id_clean", "person_number_clean",
+  "composite_id", "pkey"
+)
+
+weight_vars <- c("QuarterWeight", "AnnualWeight", "PersonWeight")
+
+outcome_derived_vars <- c(
+  "EmploymentStatusCode", "emp_code_num", "status_label",
+  "ExpandedEmploymentStatusCode", "UnemploymentStatusCode",
+  "NEETCode", "neet", "labour_force"
+)
+
+unemployed_or_employed_only <- c(
+  "OccupationCode", "IndustryCode",
+  "Sector1Code", "Sector2Code",
+  "InformalEmploymentCode", "informal_employment",
+  "LongTermUnemploymentCode", "UnderemploymentCode",
+  "MonthlyAmountRaw", "monthly_amount_raw",
+  "HoursWorkedRaw", "hours_worked_raw"
+)
+
+drop_vars <- c(identifier_vars, weight_vars,
+               outcome_derived_vars, unemployed_or_employed_only)
+
+d11_model <- d11_model %>% select(-any_of(drop_vars))
+
+```
+
+## 11.3 Train/test split (stratified)
+
+```{r train_test_split, comment=NA}
+set.seed(2026)
+
+split <- initial_split(d11_model, prop = 0.7, strata = Unemployed)
+train <- training(split)
+test  <- testing(split)
+
+```
+
+## 11.4 Preprocessing recipe
+
+```{r recipe_fit, comment=NA}
+rec <- recipe(Unemployed ~ ., data = train) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_novel(all_nominal_predictors())  %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_nzv(all_predictors())            %>%
+  step_dummy(all_nominal_predictors(), one_hot = FALSE)  %>%
+  step_zv(all_predictors()) %>%
+  step_lincomb(all_numeric_predictors())
+
+rec_prepped <- prep(rec, training = train)
+
+train_baked <- bake(rec_prepped, new_data = train)
+test_baked  <- bake(rec_prepped, new_data = test)
+
+```
+
+## 11.5 Before/after validation evidence
+
+```{r validation_evidence, comment=NA}
+validation <- tibble(
+  Stage   = c("d11_clean (after cleaning)",
+              "d11_model (after target + leakage drop)",
+              "Train (70%)", "Test (30%)",
+              "Train (baked)", "Test (baked)"),
+  Rows    = c(nrow(d11_clean), nrow(d11_model),
+              nrow(train), nrow(test),
+              nrow(train_baked), nrow(test_baked)),
+  Columns = c(ncol(d11_clean), ncol(d11_model),
+              ncol(train), ncol(test),
+              ncol(train_baked), ncol(test_baked))
+)
+kable(validation, caption = "Modelling preparation - before/after validation")
+
+strat_check <- tibble(
+  Set = c("Train", "Test"),
+  Unemployed_Pct = c(
+    round(100 * mean(train$Unemployed == 1), 2),
+    round(100 * mean(test$Unemployed  == 1), 2)
+  )
+)
+kable(strat_check, caption = "Class prevalence preserved by stratified split")
+
+```
+
+## 11.6 Export modelling artefacts
+
+```{r export_model_artefacts, comment=NA}
+saveRDS(train,        "data/Cleaned/train_raw.rds")
+saveRDS(test,         "data/Cleaned/test_raw.rds")
+saveRDS(train_baked,  "data/Cleaned/train_baked.rds")
+saveRDS(test_baked,   "data/Cleaned/test_baked.rds")
+saveRDS(rec_prepped,  "data/Cleaned/recipe_prepped.rds")
+
+```
+
+# MODELLING, EVALUATION & DEPLOYMENT
+
+```{r setup_modelling_environment}
+# 1. Read baked datasets
+train_baked <- readRDS("data/Cleaned/train_baked.rds")
+test_baked  <- readRDS("data/Cleaned/test_baked.rds")
+
+# 2. Ensure Unemployed is explicitly formatted as a factor with valid level names
+train_baked$Unemployed <- factor(train_baked$Unemployed, 
+                                 levels = c(0, 1), 
+                                 labels = c("Not_Unemployed", "Unemployed"))
+
+test_baked$Unemployed  <- factor(test_baked$Unemployed, 
+                                 levels = c(0, 1), 
+                                 labels = c("Not_Unemployed", "Unemployed"))
+
+# 3. Impute any remaining NA predictors using median imputation
+impute_proc <- preProcess(train_baked, method = c("medianImpute", "zv"))
+train_baked <- predict(impute_proc, train_baked)
+test_baked  <- predict(impute_proc, test_baked)
+
+```
+
+## 1. Baseline Model — Logistic Regression
+
+```{r model_glm}
+set.seed(2026)
+
+glm_model <- train(
+  Unemployed ~ ., 
+  data = train_baked, 
+  method = "glm", 
+  family = "binomial",
+  trControl = trainControl(
+    method = "cv", 
+    number = 5, 
+    classProbs = TRUE, 
+    summaryFunction = defaultSummary
+  )
+)
+
+# Predict on test set
+glm_preds <- predict(glm_model, newdata = test_baked)
+glm_probs <- predict(glm_model, newdata = test_baked, type = "prob")
+
+# Performance summary
+glm_cm <- confusionMatrix(
+  data = glm_preds, 
+  reference = test_baked$Unemployed, 
+  positive = "Unemployed"
+)
+print(glm_cm)
+
+```
+
+## 2. Model — Naive Bayes
+
+```{r model_naive_bayes}
+set.seed(2026)
+
+# Fit Naive Bayes Model using e1071
+nb_model <- naiveBayes(
+  Unemployed ~ ., 
+  data = train_baked
+)
+
+# Predict class labels and probabilities on test set
+nb_preds <- predict(nb_model, newdata = test_baked)
+nb_probs <- predict(nb_model, newdata = test_baked, type = "raw")
+
+# Performance summary via Confusion Matrix
+nb_cm <- confusionMatrix(
+  data = nb_preds, 
+  reference = test_baked$Unemployed, 
+  positive = "Unemployed"
+)
+print(nb_cm)
+
+# Generate CrossTable
+CrossTable(
+  x = test_baked$Unemployed, 
+  y = nb_preds, 
+  prop.chisq = FALSE, 
+  prop.c = FALSE, 
+  prop.r = FALSE,
+  dnn = c("Actual", "Predicted")
+)
+
+```
+
+## 3. Advanced Model — random forest
+
+```{r model_random_forest, echo=TRUE, warning=FALSE, message=FALSE}
+# 1. Define explicit tuning grid to bypass grid search delay
+rf_grid <- expand.grid(
+  mtry = floor(sqrt(ncol(train_baked) - 1)),
+  splitrule = "gini",
+  min.node.size = 10
+)
+
+# 2. Define train control
+train_control <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+)
+
+set.seed(2026)
+
+# 3. Fit ranger model across all available CPU cores
+rf_model <- train(
+  Unemployed ~ ., 
+  data = train_baked, 
+  method = "ranger", 
+  trControl = train_control,
+  tuneGrid = rf_grid,
+  num.trees = 50,                       # Fast tree count
+  num.threads = parallel::detectCores(), # Multi-threaded parallel processing
+  importance = "impurity",              # Enables varImp()
+  metric = "ROC"
+)
+
+# 4. Predict on test set
+rf_preds <- predict(rf_model, newdata = test_baked)
+rf_probs <- predict(rf_model, newdata = test_baked, type = "prob")
+
+# 5. Confusion Matrix Evaluation
+rf_cm <- confusionMatrix(
+  data = rf_preds, 
+  reference = test_baked$Unemployed, 
+  positive = "Unemployed"
+)
+print(rf_cm)
+```
+
+## 4. Model Evaluation & ROC-AUC Comparison
+
+```{r roc_comparison}
+roc_glm <- roc(test_baked$Unemployed, glm_probs$Unemployed)
+roc_nb  <- roc(test_baked$Unemployed, nb_probs[, "Unemployed"])
+roc_rf  <- roc(test_baked$Unemployed, rf_probs$Unemployed)
+
+plot(roc_glm, col = "blue", main = "ROC Curves Comparison across Models")
+plot(roc_nb, col = "green", add = TRUE)
+plot(roc_rf, col = "red", add = TRUE)
+legend("bottomright", 
+       legend = c(
+         paste("GLM AUC:", round(auc(roc_glm), 3)),
+         paste("NB AUC:",  round(auc(roc_nb), 3)),
+         paste("C5.0 AUC:", round(auc(roc_rf), 3))
+       ), 
+       col = c("blue", "green", "red"), 
+       lwd = 2)
+
+```
+
+## 5. Feature Importance Analysis
+
+```{r feature_importance}
+# Extract feature importance cleanly via caret
+var_imp <- varImp(rf_model)
+plot(var_imp, top = 15, main = "Top 15 Predictors of Unemployment Risk")
+```
+
+# SESSION INFO
+
+```{r session_info}
+sessionInfo()
+```

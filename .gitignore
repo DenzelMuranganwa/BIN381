@@ -1,0 +1,25 @@
+# R and RStudio local state
+.Rhistory
+.RData
+.Ruserdata
+**/.Rproj.user/
+*.Rproj.user
+
+# Original survey microdata; keep private unless redistribution is approved
+/data/raw/*.csv
+
+# Generated cleaned records, model objects, and intermediate outputs
+/data/Cleaned/*
+!/data/Cleaned/.gitkeep
+/outputs/
+
+# Dashboard workbook may embed restricted source data
+/dashboard/*.pbix
+
+# Runtime monitoring artefacts
+/deployment/monitoring_log.csv
+/deployment/monitoring_baseline.rds
+
+# Rendered R Markdown documents
+/analysis.docx
+/analysis_files/
